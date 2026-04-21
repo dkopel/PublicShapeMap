@@ -9,8 +9,6 @@ public inherited sharing class PSM_MapController {
   /** For unit tests only: bypass folder id. */
   @TestVisible
   private static String testOverrideFolderRootId;
-  @TestVisible
-  private static String testOverrideFolderName;
 
   private static String cachedFolderRootId;
   private static Integer cachedMinZoomLevel;
@@ -393,19 +391,7 @@ public inherited sharing class PSM_MapController {
       }
       return folderId;
     }
-
-    String folderName = (Test.isRunningTest() && !String.isBlank(testOverrideFolderName))
-      ? testOverrideFolderName
-      : cfg.Folder_Name__c;
-    if (String.isBlank(folderName)) {
-      throw new AuraHandledException('Map config requires Folder_Id__c or Folder_Name__c.');
-    }
-
-    String resolved = PSM_GeoShapeApiService.resolveFolderId(folderName.trim());
-    if (!Test.isRunningTest()) {
-      cachedFolderRootId = resolved;
-    }
-    return resolved;
+    throw new AuraHandledException('Map config requires Folder_Id__c.');
   }
 
   private static Integer resolveMinZoomLevel() {
@@ -432,7 +418,7 @@ public inherited sharing class PSM_MapController {
 
   private static PSM_Map_Config__mdt getActiveConfig() {
     List<PSM_Map_Config__mdt> rows = [
-      SELECT DeveloperName, MasterLabel, Folder_Name__c, Folder_Id__c, Google_API_Key__c, Zoom_Level__c
+      SELECT DeveloperName, MasterLabel, Folder_Id__c, Google_API_Key__c, Zoom_Level__c
       FROM PSM_Map_Config__mdt
       LIMIT 1
     ];

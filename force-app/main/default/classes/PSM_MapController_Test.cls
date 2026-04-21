@@ -20,12 +20,49 @@ private class PSM_MapController_Test {
     }
   }
 
+  private class DissolveHttpErrorMock implements HttpCalloutMock {
+    public HTTPResponse respond(HTTPRequest req) {
+      HttpResponse res = new HttpResponse();
+      res.setStatusCode(500);
+      res.setBody('{"error":"boom"}');
+      return res;
+    }
+  }
+
   @IsTest
   static void testGetMapBootstrap() {
     String responseJson = PSM_MapController.getMapBootstrap();
     Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
     System.assertEquals(true, payload.get('success'), responseJson);
     System.assertNotEquals(null, payload.get('googleApiKey'));
+  }
+
+  @IsTest
+  static void testGetVisibleShapesBelowConfiguredMinZoom() {
+    String responseJson = PSM_MapController.getVisibleShapesForViewport(39, 41, -82, -79, 1);
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(true, payload.get('success'), responseJson);
+    System.assertEquals(true, payload.get('belowMinZoom'), responseJson);
+    System.assertEquals(0, payload.get('shapeCount'));
+  }
+
+  @IsTest
+  static void testGetVisibleShapesAtOrAboveConfiguredMinZoom() {
+    String responseJson = PSM_MapController.getVisibleShapesForViewport(39, 41, -82, -79, 99);
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(true, payload.get('success'), responseJson);
+    System.assertEquals(false, payload.get('belowMinZoom'));
+    System.assertNotEquals(null, payload.get('shapeSpecs'));
+    System.assertNotEquals(null, payload.get('debug'));
+  }
+
+  @IsTest
+  static void testGetAllShapesForFolderReturnsPayload() {
+    String responseJson = PSM_MapController.getAllShapesForFolder();
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(true, payload.get('success'), responseJson);
+    System.assertNotEquals(null, payload.get('shapeSpecs'));
+    System.assertNotEquals(null, payload.get('shapeCount'));
   }
 
   @IsTest
@@ -42,6 +79,22 @@ private class PSM_MapController_Test {
     Map<String, Object> fc = (Map<String, Object>) parsedBody.get('geoShapes');
     List<Object> feats = (List<Object>) fc.get('features');
     System.assertEquals(1, feats.size());
+  }
+
+  @IsTest
+  static void testGetDissolvedShapeGeometryMissingIds() {
+    String responseJson = PSM_MapController.getDissolvedShapeGeometry(null);
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(false, payload.get('success'), responseJson);
+  }
+
+  @IsTest
+  static void testGetDissolvedShapeGeometryHandlesHttpError() {
+    Test.setMock(HttpCalloutMock.class, new DissolveHttpErrorMock());
+    String responseJson = PSM_MapController.getDissolvedShapeGeometry('shape-1');
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(false, payload.get('success'), responseJson);
+    System.assert(String.valueOf(payload.get('error')).contains('HTTP'));
   }
 
   @IsTest
@@ -86,5 +139,46 @@ private class PSM_MapController_Test {
     String responseJson = PSM_MapController.getDissolvedShapeGeometryBatch('{"oops":true}');
     Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
     System.assertEquals(false, payload.get('success'), responseJson);
+  }
+
+  @IsTest
+  static void testGetDissolvedShapeGeometryBatchMissingPayload() {
+    String responseJson = PSM_MapController.getDissolvedShapeGeometryBatch(null);
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(false, payload.get('success'), responseJson);
+  }
+
+  @IsTest
+  static void testGetDissolvedShapeGeometryBatchInvalidChildIdsShape() {
+    List<Object> specs = new List<Object>{
+      new Map<String, Object>{
+        'shapeRecordId' => 'a01shape1',
+        'name' => 'Bad ChildIds Type',
+        'childIds' => 'not-an-array'
+      }
+    };
+    String responseJson = PSM_MapController.getDissolvedShapeGeometryBatch(JSON.serialize(specs));
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(true, payload.get('success'), responseJson);
+    System.assertEquals(1, payload.get('requestedCount'));
+    System.assertEquals(0, payload.get('loadedCount'));
+  }
+
+  @IsTest
+  static void testGetDissolvedShapeGeometryBatchCapturesCalloutError() {
+    List<Object> specs = new List<Object>{
+      new Map<String, Object>{
+        'shapeRecordId' => 'a01shape1',
+        'name' => 'Error Territory',
+        'childIds' => new List<Object>{ 'child-1' }
+      }
+    };
+    Test.setMock(HttpCalloutMock.class, new DissolveHttpErrorMock());
+    String responseJson = PSM_MapController.getDissolvedShapeGeometryBatch(JSON.serialize(specs));
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(true, payload.get('success'), responseJson);
+    System.assertEquals(1, payload.get('requestedCount'));
+    System.assertEquals(0, payload.get('loadedCount'));
+    System.assertEquals(1, payload.get('errorCount'));
   }
 }

@@ -13,6 +13,8 @@ public inherited sharing class PSM_GeoShapeApiService {
   private static String testOverrideHeaderUserId;
   @TestVisible
   private static String testOverrideHeaderOrgId;
+  @TestVisible
+  private static List<SObject> testShapeQueryRowsOverride;
   private static final List<String> FIXED_LAT_LNG_FIELDS = new List<String>{
     'geopointe__Lat_Lng_1__c',
     'geopointe__Lat_Lng_2__c',
@@ -492,6 +494,9 @@ public inherited sharing class PSM_GeoShapeApiService {
 
   private without sharing class ShapeSoqlGateway {
     public List<SObject> queryByFolderIds(List<String> folderIds) {
+      if (Test.isRunningTest() && testShapeQueryRowsOverride != null) {
+        return testShapeQueryRowsOverride;
+      }
       if (folderIds == null || folderIds.isEmpty()) {
         return new List<SObject>();
       }
