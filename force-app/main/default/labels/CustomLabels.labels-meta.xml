@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">
+    <labels>
+        <fullName>PSM_Geopointe_User_Id</fullName>
+        <categories>PublicShapeMap</categories>
+        <language>en_US</language>
+        <protected>false</protected>
+        <shortDescription>Optional Geopointe x-user-id override</shortDescription>
+        <value>005al000000SpNmAAK</value>
+    </labels>
+    <labels>
+        <fullName>PSM_Geopointe_Org_Id</fullName>
+        <categories>PublicShapeMap</categories>
+        <language>en_US</language>
+        <protected>false</protected>
+        <shortDescription>Optional Geopointe x-organization-id override</shortDescription>
+        <value>00Dal0000016QiPEAU</value>
+    </labels>
+</CustomLabels>

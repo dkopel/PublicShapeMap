@@ -1,0 +1,218 @@
+<apex:page controller="PSM_MapController" showHeader="false" sidebar="false"
+  standardStylesheets="false" docType="html-5.0" cache="false">
+  <html lang="en">
+    <head>
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width, initial-scale=1"/>
+      <title>Shape Map</title>
+      <style type="text/css">
+        html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+        #map { height: 100vh; width: 100%; }
+        #banner {
+          position: absolute; z-index: 10; left: 8px; top: 8px; background: rgba(255,255,255,0.92);
+          padding: 8px 12px; font-family: system-ui, sans-serif; font-size: 13px; max-width: 360px;
+          border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+        }
+      </style>
+      <apex:includeScript value="https://maps.googleapis.com/maps/api/js?key={!googleApiKey}&amp;libraries=geometry"/>
+    </head>
+    <body>
+      <div id="banner">Loading map…</div>
+      <div id="map"></div>
+      <script type="text/javascript">
+        //<![CDATA[
+        (function () {
+          var map = null;
+          var inflightTimer = null;
+          var labelMarkers = [];
+
+          function setBanner(text) {
+            var el = document.getElementById('banner');
+            if (el) { el.textContent = text; }
+          }
+
+          function parseJsonSafe(s) {
+            try { return JSON.parse(s); } catch (e) { return null; }
+          }
+
+          function invokeRemote(action /*, ...args */) {
+            var args = Array.prototype.slice.call(arguments, 1);
+            return new Promise(function (resolve, reject) {
+              args.push(function (result, event) {
+                if (event && event.status === true) {
+                  resolve(result);
+                } else {
+                  reject(new Error((event && event.message) || 'Remote action failed'));
+                }
+              });
+              args.push({ escape: false, buffer: false, timeout: 120000 });
+              Visualforce.remoting.Manager.invokeAction.apply(Visualforce.remoting.Manager, [action].concat(args));
+            });
+          }
+
+          function normalizeHexColor(value) {
+            if (!value) { return null; }
+            var s = String(value).trim();
+            if (!s) { return null; }
+            if (s.charAt(0) === '#') { s = s.substring(1); }
+            if (!/^[0-9a-fA-F]{6}$/.test(s)) { return null; }
+            return '#' + s.toUpperCase();
+          }
+
+          function clearLabelMarkers() {
+            for (var i = 0; i < labelMarkers.length; i++) {
+              labelMarkers[i].setMap(null);
+            }
+            labelMarkers = [];
+          }
+
+          function renderShapeLabels() {
+            clearLabelMarkers();
+            map.data.forEach(function (feature) {
+              var name = feature.getProperty('name');
+              var lat = Number(feature.getProperty('centroidLat'));
+              var lng = Number(feature.getProperty('centroidLng'));
+              if (!name || !isFinite(lat) || !isFinite(lng)) {
+                return;
+              }
+              var marker = new google.maps.Marker({
+                map: map,
+                position: { lat: lat, lng: lng },
+                icon: {
+                  path: google.maps.SymbolPath.CIRCLE,
+                  scale: 0,
+                  fillOpacity: 0,
+                  strokeOpacity: 0
+                },
+                clickable: false,
+                label: {
+                  text: String(name),
+                  color: '#1F2937',
+                  fontSize: '11px',
+                  fontWeight: '600'
+                }
+              });
+              labelMarkers.push(marker);
+            });
+          }
+
+          async function fetchShapeFeature(spec) {
+            var childIds = spec && spec.childIds ? spec.childIds : [];
+            if (!childIds.length) { return null; }
+            var raw = await invokeRemote(
+              '{!$RemoteAction.PSM_MapController.getDissolvedShapeGeometry}',
+              childIds.join(',')
+            );
+            var geoResult = (typeof raw === 'string') ? parseJsonSafe(raw) : raw;
+            if (!geoResult || geoResult.success !== true || !geoResult.responseBody) {
+              return null;
+            }
+            var data = parseJsonSafe(geoResult.responseBody);
+            if (!data || !data.geoShapes || !data.geoShapes.features || !data.geoShapes.features.length) {
+              return null;
+            }
+            var feature = data.geoShapes.features[0];
+            if (!feature.properties) { feature.properties = {}; }
+            if (spec.name) { feature.properties.name = spec.name; }
+            if (spec.color) { feature.properties.color = spec.color; }
+            if (feature.centroid && feature.centroid.coordinates && feature.centroid.coordinates.length >= 2) {
+              feature.properties.centroidLng = feature.centroid.coordinates[0];
+              feature.properties.centroidLat = feature.centroid.coordinates[1];
+            }
+            return feature;
+          }
+
+          function loadShapes() {
+            if (!map) { return; }
+            invokeRemote('{!$RemoteAction.PSM_MapController.getAllShapesForFolder}')
+              .then(async function (result) {
+                if (inflightTimer) {
+                  window.clearTimeout(inflightTimer);
+                  inflightTimer = null;
+                }
+                var payload = (typeof result === 'string') ? parseJsonSafe(result) : result;
+                if (!payload || payload.success !== true) {
+                  var errMsg = 'Unknown error';
+                  if (payload && payload.error) {
+                    errMsg = payload.error;
+                  }
+                  setBanner(errMsg);
+                  return;
+                }
+                map.data.forEach(function (f) { map.data.remove(f); });
+                clearLabelMarkers();
+                var specs = payload.shapeSpecs || [];
+                var loaded = 0;
+                for (var i = 0; i < specs.length; i++) {
+                  var feature = await fetchShapeFeature(specs[i]);
+                  if (feature) {
+                    map.data.addGeoJson({ type: 'FeatureCollection', features: [feature] });
+                    loaded++;
+                  }
+                }
+                map.data.setStyle(function (feature) {
+                  var color = normalizeHexColor(feature.getProperty('color')) || '#2EC223';
+                  return {
+                    fillColor: color,
+                    fillOpacity: 0.35,
+                    strokeColor: color,
+                    strokeWeight: 1
+                  };
+                });
+                renderShapeLabels();
+                var n = (payload.shapeCount !== undefined) ? payload.shapeCount : loaded;
+                var dbg = '';
+                if (payload.debug) {
+                  var d = payload.debug;
+                  dbg =
+                    ' [mode:' + (d.mode != null ? d.mode : '?') +
+                    ' territories:' + (d.renderedFeatures != null ? d.renderedFeatures : '?') +
+                    ']';
+                }
+                setBanner('Showing ' + n + ' shape(s) from folder. Loaded ' + loaded + '.' + dbg);
+              })
+              .catch(function (err) {
+                if (inflightTimer) {
+                  window.clearTimeout(inflightTimer);
+                  inflightTimer = null;
+                }
+                setBanner('Error: ' + ((err && err.message) || 'Remote action failed'));
+              });
+            inflightTimer = window.setTimeout(function () {
+              setBanner('Still loading shapes... if this persists, refresh and retry.');
+            }, 15000);
+          }
+
+          function initMap() {
+            var key = '{!JSENCODE(googleApiKey)}';
+            if (!key) {
+              setBanner('Configure Google API Key on PSM Map Config custom metadata.');
+              return;
+            }
+            map = new google.maps.Map(document.getElementById('map'), {
+              center: { lat: 39.8283, lng: -98.5795 },
+              zoom: 6,
+              mapTypeId: 'roadmap',
+              streetViewControl: false,
+              mapTypeControl: true
+            });
+            loadShapes();
+          }
+
+          if (typeof google === 'undefined' || !google.maps) {
+            setBanner('Google Maps failed to load. Check API key and HTTP referrer allowlist.');
+            return;
+          }
+
+          // Avoid relying only on window load; that event may already have fired.
+          if (document.readyState === 'complete' || document.readyState === 'interactive') {
+            initMap();
+          } else {
+            window.addEventListener('load', initMap);
+          }
+        })();
+        //]]>
+      </script>
+    </body>
+  </html>
+</apex:page>
