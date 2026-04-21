@@ -1,20 +1,21 @@
 @IsTest
 private class PSM_MapController_Test {
-  private class FolderDirectMock implements HttpCalloutMock {
+  private class DissolveMock implements HttpCalloutMock {
     public HTTPResponse respond(HTTPRequest req) {
       HttpResponse res = new HttpResponse();
       res.setStatusCode(200);
-      String b = req.getBody();
-      if (b != null && b.contains('"parentId"')) {
-        res.setBody(
-          '{"geoShapes":{"type":"FeatureCollection","features":[' +
-            '{"type":"Feature","properties":{"id":"poly-1","name":"Territory","type":"Polygon"},' +
-            '"geometry":{"type":"Polygon","coordinates":[[[-106.0,39.0],[-103.0,39.0],[-103.0,41.0],[-106.0,41.0],[-106.0,39.0]]]}}' +
-            ']}}'
-        );
-      } else {
-        res.setBody('{"geoShapes":{"type":"FeatureCollection","features":[]}}');
-      }
+      Map<String, Object> body = (Map<String, Object>) JSON.deserializeUntyped(req.getBody());
+      String idsCsv = (String) body.get('id');
+      String firstId = String.isBlank(idsCsv) ? 'shape-default' : idsCsv.split(',')[0];
+      res.setBody(
+        '{"geoShapes":{"type":"FeatureCollection","features":[' +
+          '{"type":"Feature","properties":{"id":"' +
+          firstId +
+          '","type":"Polygon"},' +
+          '"centroid":{"type":"Point","coordinates":[-100.0,40.0]},' +
+          '"geometry":{"type":"Polygon","coordinates":[[[-106.0,39.0],[-103.0,39.0],[-103.0,41.0],[-106.0,41.0],[-106.0,39.0]]]}}' +
+          ']}}'
+      );
       return res;
     }
   }
@@ -28,21 +29,62 @@ private class PSM_MapController_Test {
   }
 
   @IsTest
-  static void testGetVisibleShapesLoadsFolderDirectGeometry() {
-    PSM_MapController.testOverrideFolderRootId = 'fld-root';
-    Test.setMock(HttpCalloutMock.class, new FolderDirectMock());
+  static void testGetDissolvedShapeGeometryReturnsFeatureCollection() {
+    Test.setMock(HttpCalloutMock.class, new DissolveMock());
     Test.startTest();
-    String responseJson = PSM_MapController.getVisibleShapesForViewport(0, 0, 0, 0, 0);
+    String responseJson = PSM_MapController.getDissolvedShapeGeometry('shape-1,shape-2');
     Test.stopTest();
-    PSM_MapController.testOverrideFolderRootId = null;
     Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
     System.assertEquals(true, payload.get('success'), responseJson);
-    Map<String, Object> fc = (Map<String, Object>) payload.get('geoJson');
+    String responseBody = (String) payload.get('responseBody');
+    System.assertNotEquals(null, responseBody);
+    Map<String, Object> parsedBody = (Map<String, Object>) JSON.deserializeUntyped(responseBody);
+    Map<String, Object> fc = (Map<String, Object>) parsedBody.get('geoShapes');
     List<Object> feats = (List<Object>) fc.get('features');
     System.assertEquals(1, feats.size());
-    System.assertEquals(1, payload.get('shapeCount'));
-    Map<String, Object> dbg = (Map<String, Object>) payload.get('debug');
-    System.assertNotEquals(null, dbg);
-    System.assertEquals('folder-direct', dbg.get('mode'));
+  }
+
+  @IsTest
+  static void testGetDissolvedShapeGeometryBatchLoadsFeatures() {
+    List<Object> specs = new List<Object>{
+      new Map<String, Object>{
+        'shapeRecordId' => 'a01shape1',
+        'name' => 'Territory One',
+        'color' => '#00FF00',
+        'childIds' => new List<Object>{ 'child-1a', 'child-1b' }
+      },
+      new Map<String, Object>{
+        'shapeRecordId' => 'a01shape2',
+        'name' => 'Territory Two',
+        'color' => '#0000FF',
+        'childIds' => new List<Object>{ 'child-2a' }
+      }
+    };
+
+    Test.setMock(HttpCalloutMock.class, new DissolveMock());
+    Test.startTest();
+    String responseJson = PSM_MapController.getDissolvedShapeGeometryBatch(JSON.serialize(specs));
+    Test.stopTest();
+
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(true, payload.get('success'), responseJson);
+    System.assertEquals(2, payload.get('requestedCount'));
+    System.assertEquals(2, payload.get('loadedCount'));
+    List<Object> features = (List<Object>) payload.get('features');
+    System.assertEquals(2, features.size());
+
+    Map<String, Object> feature0 = (Map<String, Object>) features[0];
+    Map<String, Object> props0 = (Map<String, Object>) feature0.get('properties');
+    System.assertEquals('Territory One', props0.get('name'));
+    System.assertEquals('#00FF00', props0.get('color'));
+    System.assertNotEquals(null, props0.get('centroidLat'));
+    System.assertNotEquals(null, props0.get('centroidLng'));
+  }
+
+  @IsTest
+  static void testGetDissolvedShapeGeometryBatchRejectsInvalidPayload() {
+    String responseJson = PSM_MapController.getDissolvedShapeGeometryBatch('{"oops":true}');
+    Map<String, Object> payload = (Map<String, Object>) JSON.deserializeUntyped(responseJson);
+    System.assertEquals(false, payload.get('success'), responseJson);
   }
 }

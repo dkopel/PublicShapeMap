@@ -542,6 +542,97 @@ public inherited sharing class PSM_GeoShapeApiService {
     return out;
   }
 
+  public static List<Map<String, Object>> listFolderShapeLoadSpecsForViewport(
+    String folderId,
+    Decimal minLat,
+    Decimal maxLat,
+    Decimal minLng,
+    Decimal maxLng
+  ) {
+    List<Map<String, Object>> out = new List<Map<String, Object>>();
+    if (String.isBlank(folderId)) {
+      return out;
+    }
+    if (minLat == null || maxLat == null || minLng == null || maxLng == null) {
+      return out;
+    }
+
+    Decimal viewportMinLat = Math.min(minLat, maxLat);
+    Decimal viewportMaxLat = Math.max(minLat, maxLat);
+    Decimal viewportMinLng = Math.min(minLng, maxLng);
+    Decimal viewportMaxLng = Math.max(minLng, maxLng);
+
+    Integer maxRows = 400;
+    for (SObject row : (new ShapeSoqlGateway()).queryByFolderIds(new List<String>{ folderId })) {
+      String type = (String) row.get('geopointe__Type__c');
+      if (isFolderType(type)) {
+        continue;
+      }
+      if (!rowOverlapsViewport(row, viewportMinLat, viewportMaxLat, viewportMinLng, viewportMaxLng)) {
+        continue;
+      }
+      List<String> childIds = extractChildShapeIdsFromCoordinateFields(row);
+      if (childIds.isEmpty()) {
+        continue;
+      }
+      Map<String, Object> spec = new Map<String, Object>();
+      spec.put('shapeRecordId', row.get('Id'));
+      spec.put('name', row.get('Name'));
+      String color = normalizeHexColor(row.get('geopointe__Color__c'));
+      if (!String.isBlank(color)) {
+        spec.put('color', color);
+      }
+      spec.put('childIds', childIds);
+      out.add(spec);
+      if (--maxRows <= 0) {
+        break;
+      }
+    }
+    return out;
+  }
+
+  private static Boolean rowOverlapsViewport(
+    SObject row,
+    Decimal viewportMinLat,
+    Decimal viewportMaxLat,
+    Decimal viewportMinLng,
+    Decimal viewportMaxLng
+  ) {
+    if (row == null) {
+      return false;
+    }
+
+    Decimal latMin = toDecimal(row.get('geopointe__Lat_Min__c'));
+    Decimal latMax = toDecimal(row.get('geopointe__Lat_Max__c'));
+    Decimal lngMin = toDecimal(row.get('geopointe__Lng_Min__c'));
+    Decimal lngMax = toDecimal(row.get('geopointe__Lng_Max__c'));
+    if (latMin != null && latMax != null && lngMin != null && lngMax != null) {
+      Decimal shapeMinLat = Math.min(latMin, latMax);
+      Decimal shapeMaxLat = Math.max(latMin, latMax);
+      Decimal shapeMinLng = Math.min(lngMin, lngMax);
+      Decimal shapeMaxLng = Math.max(lngMin, lngMax);
+      return (
+        shapeMaxLat >= viewportMinLat &&
+        shapeMinLat <= viewportMaxLat &&
+        shapeMaxLng >= viewportMinLng &&
+        shapeMinLng <= viewportMaxLng
+      );
+    }
+
+    Decimal centerLat = toDecimal(row.get('geopointe__Center__Latitude__s'));
+    Decimal centerLng = toDecimal(row.get('geopointe__Center__Longitude__s'));
+    if (centerLat != null && centerLng != null) {
+      return (
+        centerLat >= viewportMinLat &&
+        centerLat <= viewportMaxLat &&
+        centerLng >= viewportMinLng &&
+        centerLng <= viewportMaxLng
+      );
+    }
+    // If shape location fields are missing, include it to avoid false negatives.
+    return true;
+  }
+
   private static List<String> getCoordinateFieldApiNames() {
     if (coordinateFieldApiNamesCache != null) {
       return coordinateFieldApiNamesCache;

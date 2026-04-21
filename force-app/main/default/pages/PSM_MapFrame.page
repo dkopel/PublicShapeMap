@@ -13,11 +13,36 @@
           padding: 8px 12px; font-family: system-ui, sans-serif; font-size: 13px; max-width: 360px;
           border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.2);
         }
+        #zoom-toast {
+          position: absolute; z-index: 11; top: 8px; left: 50%; transform: translateX(-50%);
+          background: rgba(219, 234, 254, 0.95); color: #1E3A8A;
+          border: 1px solid rgba(96, 165, 250, 0.85);
+          padding: 8px 12px; border-radius: 6px;
+          font-family: system-ui, sans-serif; font-size: 13px; font-weight: 600;
+          box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+          display: none;
+        }
+        #zoom-toast.show {
+          display: block;
+        }
+        #debug-stats {
+          position: absolute; z-index: 10; left: 8px; top: 66px; background: rgba(17,24,39,0.9);
+          color: #F9FAFB; padding: 6px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 12px; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+        }
+        #debug-zoom {
+          position: absolute; z-index: 10; right: 8px; top: 8px; background: rgba(17,24,39,0.9);
+          color: #F9FAFB; padding: 6px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 12px; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+        }
       </style>
       <apex:includeScript value="https://maps.googleapis.com/maps/api/js?key={!googleApiKey}&amp;libraries=geometry"/>
     </head>
     <body>
       <div id="banner">Loading map…</div>
+      <div id="zoom-toast">Zoom in to load shapes.</div>
+      <div id="debug-stats">On-map: 0 | Candidates: 0</div>
+      <div id="debug-zoom">Zoom: --</div>
       <div id="map"></div>
       <script type="text/javascript">
         //<![CDATA[
@@ -25,10 +50,170 @@
           var map = null;
           var inflightTimer = null;
           var labelMarkers = [];
+          var loadedShapeIds = {};
+          var pendingShapeIds = {};
+          var viewportDebounceTimer = null;
+          var viewportRequestSeq = 0;
+          var latestViewportRequestSeq = 0;
+          var MIN_SHAPE_ZOOM = (function () {
+            var parsed = Number({!minZoom});
+            if (!isFinite(parsed) || parsed <= 0) {
+              return 8;
+            }
+            return Math.floor(parsed);
+          })();
+          // Batch mode is currently disabled by default because large dissolved
+          // geometries can exceed CPU in a single Apex transaction.
+          var USE_BATCH_DISSOLVE = false;
+          var BATCH_SIZE = 6;
+          var BATCH_WORKERS = 2;
+          var LEGACY_WORKERS = 2;
 
           function setBanner(text) {
             var el = document.getElementById('banner');
             if (el) { el.textContent = text; }
+          }
+
+          function setDebugZoom(zoomLevel) {
+            var el = document.getElementById('debug-zoom');
+            if (!el) { return; }
+            var z = (zoomLevel === null || zoomLevel === undefined || !isFinite(zoomLevel)) ? '--' : String(zoomLevel);
+            el.textContent = 'Zoom: ' + z;
+            updateDebugStats();
+          }
+
+          function updateZoomToast() {
+            var el = document.getElementById('zoom-toast');
+            if (!el || !map) { return; }
+            el.textContent = 'You MUST zoom in to level ' + MIN_SHAPE_ZOOM + ' to start seeing Shapes.';
+            var z = map.getZoom();
+            if (!isFinite(z) || z < MIN_SHAPE_ZOOM) {
+              el.classList.add('show');
+            } else {
+              el.classList.remove('show');
+            }
+          }
+
+          function getRenderedShapeCount() {
+            if (!map) { return 0; }
+            var count = 0;
+            map.data.forEach(function () { count++; });
+            return count;
+          }
+
+          function updateDebugStats(candidateCount) {
+            var el = document.getElementById('debug-stats');
+            if (!el) { return; }
+            var candidates = (candidateCount === null || candidateCount === undefined) ? '--' : String(candidateCount);
+            el.textContent = 'On-map: ' + getRenderedShapeCount() + ' | Candidates: ' + candidates;
+          }
+
+          function getViewportBoundsBox() {
+            if (!map) { return null; }
+            var bounds = map.getBounds();
+            if (!bounds) { return null; }
+            var sw = bounds.getSouthWest();
+            var ne = bounds.getNorthEast();
+            return {
+              minLat: sw.lat(),
+              maxLat: ne.lat(),
+              minLng: sw.lng(),
+              maxLng: ne.lng()
+            };
+          }
+
+          function featureIntersectsViewport(feature, viewport) {
+            if (!feature || !viewport) { return true; }
+            if (feature.properties) {
+              var bMinLat = Number(feature.properties.bboxMinLat);
+              var bMaxLat = Number(feature.properties.bboxMaxLat);
+              var bMinLng = Number(feature.properties.bboxMinLng);
+              var bMaxLng = Number(feature.properties.bboxMaxLng);
+              if (isFinite(bMinLat) && isFinite(bMaxLat) && isFinite(bMinLng) && isFinite(bMaxLng)) {
+                return (
+                  bMaxLat >= viewport.minLat &&
+                  bMinLat <= viewport.maxLat &&
+                  bMaxLng >= viewport.minLng &&
+                  bMinLng <= viewport.maxLng
+                );
+              }
+            }
+            if (feature.centroid && feature.centroid.coordinates && feature.centroid.coordinates.length >= 2) {
+              var cLng = Number(feature.centroid.coordinates[0]);
+              var cLat = Number(feature.centroid.coordinates[1]);
+              if (isFinite(cLat) && isFinite(cLng)) {
+                return (
+                  cLat >= viewport.minLat &&
+                  cLat <= viewport.maxLat &&
+                  cLng >= viewport.minLng &&
+                  cLng <= viewport.maxLng
+                );
+              }
+            }
+            return true;
+          }
+
+          function pruneFeaturesToViewport(specs) {
+            var visibleIds = {};
+            for (var i = 0; i < specs.length; i++) {
+              var sid = specs[i] && specs[i].shapeRecordId ? String(specs[i].shapeRecordId) : null;
+              if (sid) {
+                visibleIds[sid] = true;
+              }
+            }
+
+            var toRemove = [];
+            map.data.forEach(function (feature) {
+              var sid = feature.getProperty('shapeRecordId');
+              var key = sid ? String(sid) : null;
+              if (!key || visibleIds[key] !== true) {
+                toRemove.push(feature);
+                if (key) {
+                  delete loadedShapeIds[key];
+                  delete pendingShapeIds[key];
+                }
+              }
+            });
+            for (var j = 0; j < toRemove.length; j++) {
+              map.data.remove(toRemove[j]);
+            }
+            pruneRenderedFeaturesToViewport();
+            updateDebugStats(specs.length);
+          }
+
+          function pruneRenderedFeaturesToViewport() {
+            var viewport = getViewportBoundsBox();
+            if (!viewport) { return; }
+            var toRemove = [];
+            map.data.forEach(function (feature) {
+              var bboxMinLat = Number(feature.getProperty('bboxMinLat'));
+              var bboxMaxLat = Number(feature.getProperty('bboxMaxLat'));
+              var bboxMinLng = Number(feature.getProperty('bboxMinLng'));
+              var bboxMaxLng = Number(feature.getProperty('bboxMaxLng'));
+              if (
+                isFinite(bboxMinLat) && isFinite(bboxMaxLat) &&
+                isFinite(bboxMinLng) && isFinite(bboxMaxLng)
+              ) {
+                var intersects = (
+                  bboxMaxLat >= viewport.minLat &&
+                  bboxMinLat <= viewport.maxLat &&
+                  bboxMaxLng >= viewport.minLng &&
+                  bboxMinLng <= viewport.maxLng
+                );
+                if (!intersects) {
+                  toRemove.push(feature);
+                }
+              }
+            });
+            for (var i = 0; i < toRemove.length; i++) {
+              var sid = toRemove[i].getProperty('shapeRecordId');
+              if (sid) {
+                delete loadedShapeIds[String(sid)];
+                delete pendingShapeIds[String(sid)];
+              }
+              map.data.remove(toRemove[i]);
+            }
+            updateDebugStats();
           }
 
           function parseJsonSafe(s) {
@@ -96,7 +281,70 @@
             });
           }
 
-          async function fetchShapeFeature(spec) {
+          function splitSpecsIntoBatches(specs, batchSize) {
+            var out = [];
+            if (!specs || !specs.length) { return out; }
+            var size = Math.max(1, batchSize || BATCH_SIZE);
+            for (var i = 0; i < specs.length; i += size) {
+              out.push(specs.slice(i, i + size));
+            }
+            return out;
+          }
+
+          async function fetchFeaturesForBatch(specBatch) {
+            if (!specBatch || !specBatch.length) {
+              return { features: [], loadedCount: 0, errorCount: 0 };
+            }
+            var raw = await invokeRemote(
+              '{!$RemoteAction.PSM_MapController.getDissolvedShapeGeometryBatch}',
+              JSON.stringify(specBatch)
+            );
+            var batchResult = (typeof raw === 'string') ? parseJsonSafe(raw) : raw;
+            if (!batchResult || batchResult.success !== true) {
+              return { features: [], loadedCount: 0, errorCount: 1 };
+            }
+            return {
+              features: batchResult.features || [],
+              loadedCount: Number(batchResult.loadedCount || 0),
+              errorCount: Number(batchResult.errorCount || 0)
+            };
+          }
+
+          async function loadFeaturesInBatches(specs) {
+            var batches = splitSpecsIntoBatches(specs, BATCH_SIZE);
+            if (!batches.length) {
+              return { loaded: 0, batchErrors: 0 };
+            }
+            var nextIdx = 0;
+            var loaded = 0;
+            var batchErrors = 0;
+            var workers = Math.max(1, BATCH_WORKERS);
+            async function worker() {
+              while (true) {
+                var idx = nextIdx++;
+                if (idx >= batches.length) { break; }
+                var result = await fetchFeaturesForBatch(batches[idx]);
+                if (result.features && result.features.length) {
+                  map.data.addGeoJson({ type: 'FeatureCollection', features: result.features });
+                }
+                loaded += result.loadedCount || 0;
+                batchErrors += result.errorCount || 0;
+                setBanner(
+                  'Loading shapes... ' +
+                  loaded + '/' + specs.length +
+                  ' (' + (idx + 1) + '/' + batches.length + ' batches)'
+                );
+              }
+            }
+            var promises = [];
+            for (var i = 0; i < workers; i++) {
+              promises.push(worker());
+            }
+            await Promise.all(promises);
+            return { loaded: loaded, batchErrors: batchErrors };
+          }
+
+          async function fetchShapeFeatureLegacy(spec) {
             var childIds = spec && spec.childIds ? spec.childIds : [];
             if (!childIds.length) { return null; }
             var raw = await invokeRemote(
@@ -104,28 +352,134 @@
               childIds.join(',')
             );
             var geoResult = (typeof raw === 'string') ? parseJsonSafe(raw) : raw;
-            if (!geoResult || geoResult.success !== true || !geoResult.responseBody) {
+            if (!geoResult || geoResult.success !== true) {
               return null;
             }
-            var data = parseJsonSafe(geoResult.responseBody);
-            if (!data || !data.geoShapes || !data.geoShapes.features || !data.geoShapes.features.length) {
+            var geoShapes = geoResult.geoShapes;
+            if ((!geoShapes || !geoShapes.features) && geoResult.responseBody) {
+              var parsedBody = parseJsonSafe(geoResult.responseBody);
+              if (parsedBody && parsedBody.geoShapes) {
+                geoShapes = parsedBody.geoShapes;
+              }
+            }
+            if (!geoShapes || !geoShapes.features || !geoShapes.features.length) {
               return null;
             }
-            var feature = data.geoShapes.features[0];
+            var feature = geoShapes.features[0];
             if (!feature.properties) { feature.properties = {}; }
+            if (spec.shapeRecordId) { feature.properties.shapeRecordId = String(spec.shapeRecordId); }
             if (spec.name) { feature.properties.name = spec.name; }
             if (spec.color) { feature.properties.color = spec.color; }
             if (feature.centroid && feature.centroid.coordinates && feature.centroid.coordinates.length >= 2) {
               feature.properties.centroidLng = feature.centroid.coordinates[0];
               feature.properties.centroidLat = feature.centroid.coordinates[1];
             }
+            if (feature.bbox && feature.bbox.length >= 4) {
+              feature.properties.bboxMinLng = feature.bbox[0];
+              feature.properties.bboxMinLat = feature.bbox[1];
+              feature.properties.bboxMaxLng = feature.bbox[2];
+              feature.properties.bboxMaxLat = feature.bbox[3];
+            }
             return feature;
           }
 
-          function loadShapes() {
+          async function loadFeaturesLegacy(specs) {
+            var loaded = 0;
+            var idx = 0;
+            var workers = Math.max(1, LEGACY_WORKERS);
+            async function worker() {
+              while (true) {
+                var i = idx++;
+                if (i >= specs.length) { break; }
+                var spec = specs[i];
+                var shapeRecordId = spec && spec.shapeRecordId ? String(spec.shapeRecordId) : null;
+                if (shapeRecordId && pendingShapeIds[shapeRecordId] === true) {
+                  continue;
+                }
+                if (shapeRecordId) {
+                  pendingShapeIds[shapeRecordId] = true;
+                }
+                var feature = await fetchShapeFeatureLegacy(spec);
+                if (feature) {
+                  var viewport = getViewportBoundsBox();
+                  if (!featureIntersectsViewport(feature, viewport)) {
+                    if (shapeRecordId) {
+                      delete pendingShapeIds[shapeRecordId];
+                    }
+                    continue;
+                  }
+                  map.data.addGeoJson({ type: 'FeatureCollection', features: [feature] });
+                  loaded++;
+                  setBanner('Loading shapes... ' + loaded + '/' + specs.length + ' (legacy)');
+                  if (shapeRecordId) {
+                    loadedShapeIds[shapeRecordId] = true;
+                  }
+                  updateDebugStats();
+                }
+                if (shapeRecordId) {
+                  delete pendingShapeIds[shapeRecordId];
+                }
+              }
+            }
+            var promises = [];
+            for (var w = 0; w < workers; w++) {
+              promises.push(worker());
+            }
+            await Promise.all(promises);
+            return loaded;
+          }
+
+          function clearMapData() {
+            map.data.forEach(function (f) { map.data.remove(f); });
+            clearLabelMarkers();
+            loadedShapeIds = {};
+            pendingShapeIds = {};
+            updateDebugStats(0);
+          }
+
+          function getViewportParams() {
+            if (!map) { return null; }
+            var bounds = map.getBounds();
+            if (!bounds) { return null; }
+            var sw = bounds.getSouthWest();
+            var ne = bounds.getNorthEast();
+            return {
+              minLat: sw.lat(),
+              maxLat: ne.lat(),
+              minLng: sw.lng(),
+              maxLng: ne.lng(),
+              zoom: map.getZoom() || 0
+            };
+          }
+
+          function scheduleViewportLoad() {
+            if (viewportDebounceTimer) {
+              window.clearTimeout(viewportDebounceTimer);
+            }
+            viewportDebounceTimer = window.setTimeout(function () {
+              loadShapesForViewport(false);
+            }, 250);
+          }
+
+          function loadShapesForViewport(isInitialLoad) {
             if (!map) { return; }
-            invokeRemote('{!$RemoteAction.PSM_MapController.getAllShapesForFolder}')
+            var viewport = getViewportParams();
+            if (!viewport) { return; }
+            viewportRequestSeq++;
+            var requestSeq = viewportRequestSeq;
+            latestViewportRequestSeq = requestSeq;
+            invokeRemote(
+              '{!$RemoteAction.PSM_MapController.getVisibleShapesForViewport}',
+              viewport.minLat,
+              viewport.maxLat,
+              viewport.minLng,
+              viewport.maxLng,
+              viewport.zoom
+            )
               .then(async function (result) {
+                if (requestSeq !== latestViewportRequestSeq) {
+                  return;
+                }
                 if (inflightTimer) {
                   window.clearTimeout(inflightTimer);
                   inflightTimer = null;
@@ -139,16 +493,39 @@
                   setBanner(errMsg);
                   return;
                 }
-                map.data.forEach(function (f) { map.data.remove(f); });
-                clearLabelMarkers();
+                if (payload.belowMinZoom === true) {
+                  clearMapData();
+                  setBanner('Zoom in to ' + MIN_SHAPE_ZOOM + '+ to load shapes.');
+                  updateDebugStats(0);
+                  updateZoomToast();
+                  return;
+                }
                 var specs = payload.shapeSpecs || [];
-                var loaded = 0;
-                for (var i = 0; i < specs.length; i++) {
-                  var feature = await fetchShapeFeature(specs[i]);
-                  if (feature) {
-                    map.data.addGeoJson({ type: 'FeatureCollection', features: [feature] });
-                    loaded++;
+                pruneFeaturesToViewport(specs);
+                updateDebugStats(specs.length);
+                var specsToLoad = [];
+                for (var s = 0; s < specs.length; s++) {
+                  var sid = specs[s] && specs[s].shapeRecordId ? String(specs[s].shapeRecordId) : null;
+                  if (!sid) {
+                    specsToLoad.push(specs[s]);
+                    continue;
                   }
+                  if (loadedShapeIds[sid] || pendingShapeIds[sid]) {
+                    continue;
+                  }
+                  specsToLoad.push(specs[s]);
+                }
+                var loaded = 0;
+                var loadStats = { batchErrors: 0 };
+                if (USE_BATCH_DISSOLVE) {
+                  loadStats = await loadFeaturesInBatches(specsToLoad);
+                  loaded = loadStats.loaded || 0;
+                  if (loaded === 0 && specsToLoad.length > 0) {
+                    setBanner('Batch dissolve returned 0 shapes, retrying with fallback loader...');
+                    loaded = await loadFeaturesLegacy(specsToLoad);
+                  }
+                } else {
+                  loaded = await loadFeaturesLegacy(specsToLoad);
                 }
                 map.data.setStyle(function (feature) {
                   var color = normalizeHexColor(feature.getProperty('color')) || '#2EC223';
@@ -169,9 +546,20 @@
                     ' territories:' + (d.renderedFeatures != null ? d.renderedFeatures : '?') +
                     ']';
                 }
-                setBanner('Showing ' + n + ' shape(s) from folder. Loaded ' + loaded + '.' + dbg);
+                if ((loadStats.batchErrors || 0) > 0) {
+                  dbg += ' [batchErrors:' + loadStats.batchErrors + ']';
+                }
+                setBanner(
+                  'Viewport shapes: ' + n +
+                  '. Newly loaded ' + loaded +
+                  '. Cached ' + Object.keys(loadedShapeIds).length + '.' + dbg
+                );
+                updateDebugStats(specs.length);
               })
               .catch(function (err) {
+                if (requestSeq !== latestViewportRequestSeq) {
+                  return;
+                }
                 if (inflightTimer) {
                   window.clearTimeout(inflightTimer);
                   inflightTimer = null;
@@ -196,7 +584,17 @@
               streetViewControl: false,
               mapTypeControl: true
             });
-            loadShapes();
+            setDebugZoom(map.getZoom());
+            updateZoomToast();
+            map.addListener('zoom_changed', function () {
+              setDebugZoom(map.getZoom());
+              updateZoomToast();
+              pruneRenderedFeaturesToViewport();
+              scheduleViewportLoad();
+            });
+            map.addListener('idle', scheduleViewportLoad);
+            map.addListener('dragend', scheduleViewportLoad);
+            loadShapesForViewport(true);
           }
 
           if (typeof google === 'undefined' || !google.maps) {

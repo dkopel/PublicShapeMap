@@ -1,6 +1,6 @@
 # Public Shape Map (Salesforce)
 
-Custom Site-ready map that shows Geopointe **shapes** from a configured **folder**, loading only shapes whose **centroid** (or bbox center) falls in the current map viewport at zoom ≥ 5.
+Custom Site-ready map that shows Geopointe **shapes** from a configured **folder** using Salesforce-side remoting and batched dissolve requests.
 
 ## Configuration (Custom Metadata)
 
@@ -16,7 +16,7 @@ Seed record: `PSM_Map_Config.Default_Map` – update values after deploy.
 | Page | Purpose |
 |------|---------|
 | `PSM_SiteHost` | Host page with iframe to the map (use as Site “Active Site Home Page” or custom URL). |
-| `PSM_MapFrame` | Google Map + remoting to load filtered GeoJSON polygons. |
+| `PSM_MapFrame` | Google Map + remoting to load shape specs, then request dissolved polygons in Salesforce-side batches. |
 
 ## Salesforce Site setup (manual)
 
@@ -29,6 +29,6 @@ Seed record: `PSM_Map_Config.Default_Map` – update values after deploy.
 ## API behavior
 
 - Calls `POST https://api.geopointe.io/v2/geoShapes/getshapes` with headers `x-application-name: geopointe`, `x-user-id`, `x-organization-id` (same pattern as Geopointe public map samples).
-- Resolves folder by search + **exact name** match, lists children by `parentId`, filters by centroid vs bounds, then loads geometry in batches of 20 shape ids.
+- Resolves folder by search + **exact name** match (or `Folder_Id__c` override), loads shape specs from Salesforce, then requests dissolved geometries in bounded remoting batches.
 
 For non-production Geopointe endpoints, add another Remote Site and adjust `PSM_GeoShapeApiService.GETSHAPES_ENDPOINT`.
