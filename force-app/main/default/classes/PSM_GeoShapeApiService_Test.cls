@@ -408,6 +408,118 @@ private class PSM_GeoShapeApiService_Test {
     System.assertEquals(0, feats.size());
   }
 
+  private class FolderFeatureCollectionMock implements HttpCalloutMock {
+    public HTTPResponse respond(HTTPRequest req) {
+      Map<String, Object> body = (Map<String, Object>) JSON.deserializeUntyped(req.getBody());
+      Boolean dissolve = body.containsKey('dissolve') ? (Boolean) body.get('dissolve') : false;
+      HttpResponse res = new HttpResponse();
+      res.setStatusCode(200);
+      if (dissolve == true) {
+        res.setBody(
+          '{"geoShapes":{"type":"FeatureCollection","features":[' +
+          '{"type":"Feature","bbox":[-101.0,39.0,-99.0,41.0]}' +
+          ']}}'
+        );
+      } else {
+        res.setBody(
+          '{"geoShapes":{"type":"FeatureCollection","features":[' +
+          '{"type":"Feature","properties":{"id":"sf-shape-1","type":"Polygon"},' +
+          '"centroid":{"type":"Point","coordinates":[-100.0,40.0]}}' +
+          ']}}'
+        );
+      }
+      return res;
+    }
+  }
+
+  @IsTest
+  static void testBuildFeatureCollectionForFolderUsesShapeIdsPath() {
+    SObject row = buildShapeRow(
+      'a0A000000000008AAA',
+      'Folder Loaded',
+      'root',
+      'Polygon',
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      'CA-US-44444'
+    );
+    if (row == null) {
+      System.assert(true, 'geopointe__Shape__c not available in this org test context.');
+      return;
+    }
+    PSM_GeoShapeApiService.testShapeQueryRowsOverride = new List<SObject>{ row };
+    Test.setMock(HttpCalloutMock.class, new FolderFeatureCollectionMock());
+    try {
+      Map<String, Object> fc = PSM_GeoShapeApiService.buildFeatureCollectionForFolder('root');
+      List<Object> feats = (List<Object>) fc.get('features');
+      System.assertEquals(1, feats.size());
+    } finally {
+      PSM_GeoShapeApiService.testShapeQueryRowsOverride = null;
+    }
+  }
+
+  private class FolderFallbackDissolveMock implements HttpCalloutMock {
+    public HTTPResponse respond(HTTPRequest req) {
+      Map<String, Object> body = (Map<String, Object>) JSON.deserializeUntyped(req.getBody());
+      Boolean dissolve = body.containsKey('dissolve') ? (Boolean) body.get('dissolve') : false;
+      HttpResponse res = new HttpResponse();
+      res.setStatusCode(200);
+      if (dissolve == true) {
+        res.setBody(
+          '{"geoShapes":{"type":"FeatureCollection","features":[' +
+          '{"type":"Feature","properties":{"type":"Polygon"},' +
+          '"bbox":[-101.0,39.0,-99.0,41.0]}' +
+          ']}}'
+        );
+      } else {
+        res.setBody('{"geoShapes":{"type":"FeatureCollection","features":[]}}');
+      }
+      return res;
+    }
+  }
+
+  @IsTest
+  static void testBuildFeatureCollectionForFolderFallsBackToDissolve() {
+    SObject row = buildShapeRow(
+      'a0A000000000009AAA',
+      'Needs Dissolve',
+      'root',
+      'Polygon',
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      '0f0f0f',
+      'CA-US-55555,CA-US-66666'
+    );
+    if (row == null) {
+      System.assert(true, 'geopointe__Shape__c not available in this org test context.');
+      return;
+    }
+    PSM_GeoShapeApiService.testShapeQueryRowsOverride = new List<SObject>{ row };
+    Test.setMock(HttpCalloutMock.class, new FolderFallbackDissolveMock());
+    try {
+      Map<String, Object> fc = PSM_GeoShapeApiService.buildFeatureCollectionForFolder('root');
+      List<Object> feats = (List<Object>) fc.get('features');
+      System.assertEquals(1, feats.size());
+      Map<String, Object> feature = (Map<String, Object>) feats[0];
+      Map<String, Object> props = (Map<String, Object>) feature.get('properties');
+      System.assertEquals('Needs Dissolve', props.get('name'));
+      System.assertEquals('#0F0F0F', props.get('color'));
+      System.assertNotEquals(null, props.get('centroidLat'));
+      System.assertNotEquals(null, props.get('centroidLng'));
+    } finally {
+      PSM_GeoShapeApiService.testShapeQueryRowsOverride = null;
+    }
+  }
+
   @IsTest
   static void testListFolderShapeLoadSpecsForViewportInputValidation() {
     List<Map<String, Object>> a = PSM_GeoShapeApiService.listFolderShapeLoadSpecsForViewport(null, 0, 1, 0, 1);
@@ -612,6 +724,75 @@ private class PSM_GeoShapeApiService_Test {
     } finally {
       PSM_GeoShapeApiService.testShapeQueryRowsOverride = null;
     }
+  }
+
+  private class MissingCenterBackfillMock implements HttpCalloutMock {
+    public HTTPResponse respond(HTTPRequest req) {
+      HttpResponse res = new HttpResponse();
+      res.setStatusCode(200);
+      res.setBody(
+        '{"geoShapes":{"type":"FeatureCollection","features":[' +
+        '{"type":"Feature","properties":{"id":"a0A000000000010AAA","type":"Polygon","parentId":"root"},' +
+        '"bbox":[-104.0,39.0,-100.0,41.0]}' +
+        ']}}'
+      );
+      return res;
+    }
+  }
+
+  @IsTest
+  static void testListShapeSummariesForParentBackfillsMissingCenterViaGeometry() {
+    SObject missingCenter = buildShapeRow(
+      'a0A000000000010AAA',
+      'Backfill Needed',
+      'root',
+      'Polygon',
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    );
+    if (missingCenter == null) {
+      System.assert(true, 'geopointe__Shape__c not available in this org test context.');
+      return;
+    }
+    PSM_GeoShapeApiService.testShapeQueryRowsOverride = new List<SObject>{ missingCenter };
+    Test.setMock(HttpCalloutMock.class, new MissingCenterBackfillMock());
+    try {
+      List<PSM_GeoShapeApiService.ShapeSummary> rows = PSM_GeoShapeApiService.listShapeSummariesForParent('root');
+      System.assertEquals(1, rows.size());
+      System.assertEquals('a0A000000000010AAA', rows[0].id);
+      System.assertNotEquals(null, rows[0].lat);
+      System.assertNotEquals(null, rows[0].lng);
+    } finally {
+      PSM_GeoShapeApiService.testShapeQueryRowsOverride = null;
+    }
+  }
+
+  private class SalesforceCatalogIdExpansionMock implements HttpCalloutMock {
+    public HTTPResponse respond(HTTPRequest req) {
+      HttpResponse res = new HttpResponse();
+      res.setStatusCode(200);
+      res.setBody(
+        '{"geoShapes":{"type":"FeatureCollection","features":[' +
+        '{"type":"Feature","properties":{"id":"poly-from-sf-id","type":"Polygon","parentId":"001ABCDEF123456789"},' +
+        '"centroid":{"type":"Point","coordinates":[-95.0,33.0]}}' +
+        ']}}'
+      );
+      return res;
+    }
+  }
+
+  @IsTest
+  static void testListSummariesTreatsSalesforceIdAsNonNumericTopParent() {
+    Test.setMock(HttpCalloutMock.class, new SalesforceCatalogIdExpansionMock());
+    List<PSM_GeoShapeApiService.ShapeSummary> rows = PSM_GeoShapeApiService.testListSummaries('001ABCDEF123456789');
+    System.assertEquals(1, rows.size());
+    System.assertEquals('poly-from-sf-id', rows[0].id);
   }
 
   private class FolderExpansionHttpErrorMock implements HttpCalloutMock {

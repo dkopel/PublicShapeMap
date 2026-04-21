@@ -6,7 +6,6 @@ public inherited sharing class PSM_GeoShapeApiService {
   public static final String GETSHAPES_ENDPOINT = 'https://api.geopointe.io/v2/geoShapes/getshapes';
   public static final Integer GEOMETRY_CHUNK_SIZE = 20;
   public static final Integer MAX_FOLDER_FALLBACK_CHILD_IDS = 40;
-  public static final Integer MAX_ZIP_CENTROID_CALLOUTS = 40;
   private static List<String> coordinateFieldApiNamesCache;
   private static String geopointeShapeIdFieldApiNameCache;
   @TestVisible
@@ -366,7 +365,6 @@ public inherited sharing class PSM_GeoShapeApiService {
       List<ShapeSummary> out = new List<ShapeSummary>();
       Map<String, ShapeSummary> missingCenterById = new Map<String, ShapeSummary>();
       List<String> missingCenterIds = new List<String>();
-      Map<String, LatLngPair> zipCentroidCache = new Map<String, LatLngPair>();
       Set<String> seenShapeIds = new Set<String>();
       Set<String> visitedFolderIds = new Set<String>();
       List<String> queue = new List<String>{ rootFolderId };
@@ -414,26 +412,6 @@ public inherited sharing class PSM_GeoShapeApiService {
             }
           }
           if (lat == null || lng == null) {
-            List<String> zipCodes = extractZipCodesFromCoordinateFields(row);
-            if (!zipCodes.isEmpty()) {
-              Integer addedFromZips = 0;
-              for (String zipCode : zipCodes) {
-                LatLngPair zipCenter = resolveZipCentroid(zipCode, zipCentroidCache);
-                if (zipCenter == null) {
-                  continue;
-                }
-                out.add(new ShapeSummary(sid, zipCenter.lat, zipCenter.lng, parentId, type));
-                addedFromZips++;
-                if (out.size() >= maxRows) {
-                  break;
-                }
-              }
-              if (addedFromZips > 0) {
-                seenShapeIds.add(sid);
-                continue;
-              }
-            }
-
             ShapeSummary pending = new ShapeSummary(sid, null, null, parentId, type);
             missingCenterById.put(sid, pending);
             missingCenterIds.add(sid);
@@ -669,114 +647,9 @@ public inherited sharing class PSM_GeoShapeApiService {
     return geopointeShapeIdFieldApiNameCache;
   }
 
-  private static List<String> extractZipCodesFromCoordinateFields(SObject row) {
-    List<String> out = new List<String>();
-    if (row == null) {
-      return out;
-    }
-    Set<String> seen = new Set<String>();
-    Pattern zipPattern = Pattern.compile('\\b\\d{5}(?:-\\d{4})?\\b');
-    Integer consecutiveBlanks = 0;
-    for (String fieldApiName : getCoordinateFieldApiNames()) {
-      Object raw = row.get(fieldApiName);
-      if (raw == null) {
-        consecutiveBlanks++;
-        if (consecutiveBlanks >= 1 && looksLikeLatLngBucket(fieldApiName)) {
-          break;
-        }
-        continue;
-      }
-      String text = String.valueOf(raw);
-      if (String.isBlank(text)) {
-        consecutiveBlanks++;
-        if (consecutiveBlanks >= 1 && looksLikeLatLngBucket(fieldApiName)) {
-          break;
-        }
-        continue;
-      }
-      consecutiveBlanks = 0;
-      String normalizedText = text.replaceAll('<[^>]+>', ',');
-      Matcher m = zipPattern.matcher(normalizedText);
-      while (m.find()) {
-        String zip = m.group(0);
-        if (!String.isBlank(zip) && !seen.contains(zip)) {
-          seen.add(zip);
-          out.add(zip);
-          if (out.size() >= 100) {
-            return out;
-          }
-        }
-      }
-    }
-    return out;
-  }
-
   private static Boolean looksLikeLatLngBucket(String fieldApiName) {
     String n = normalize(fieldApiName);
     return !String.isBlank(n) && (n.contains('lat_lng_') || n.contains('latlng'));
-  }
-
-  private class CoordinateFieldComparator implements Comparator<String> {
-    public Integer compare(String a, String b) {
-      Integer ai = extractTrailingInteger(a);
-      Integer bi = extractTrailingInteger(b);
-      if (ai != null && bi != null && ai != bi) {
-        return ai < bi ? -1 : 1;
-      }
-      String an = normalize(a);
-      String bn = normalize(b);
-      if (an == bn) {
-        return 0;
-      }
-      return an < bn ? -1 : 1;
-    }
-  }
-
-  private static Integer extractTrailingInteger(String value) {
-    if (String.isBlank(value)) {
-      return null;
-    }
-    Matcher m = Pattern.compile('(\\d+)(?:__c)?$').matcher(value);
-    if (!m.find()) {
-      return null;
-    }
-    try {
-      return Integer.valueOf(m.group(1));
-    } catch (Exception ignore) {
-      return null;
-    }
-  }
-
-  private static LatLngPair resolveZipCentroid(String zipCode, Map<String, LatLngPair> cache) {
-    if (String.isBlank(zipCode)) {
-      return null;
-    }
-    String key = zipCode.trim();
-    if (cache != null && cache.containsKey(key)) {
-      return cache.get(key);
-    }
-    if (cache != null && cache.size() >= MAX_ZIP_CENTROID_CALLOUTS) {
-      return null;
-    }
-
-    Map<String, Object> body = new Map<String, Object>{
-      'search' => key,
-      'type' => 'ZIP Code (USPS)',
-      'fields' => 'id,type,centroid',
-      'featureCollection' => true
-    };
-    List<Map<String, Object>> features = tryRunGetShapesQuery(body, 'zip-centroid:' + key, null);
-    LatLngPair out = null;
-    if (!features.isEmpty()) {
-      out = extractCentroid(features[0]);
-      if (out == null) {
-        out = extractBBoxCenter(features[0]);
-      }
-    }
-    if (cache != null) {
-      cache.put(key, out);
-    }
-    return out;
   }
 
   /**
